@@ -1,0 +1,159 @@
+import cv2
+import tkinter as tk
+from PIL import Image, ImageTk
+import math
+import numpy as np
+from collections import deque
+import mediapipe.python.solutions.hands as mp_hands
+import mediapipe.python.solutions.drawing_utils as mp_draw
+
+class PlanetUltimateApp:
+    def __init__(self, window, title):
+        self.window = window
+        self.window.title(title)
+
+        self.WIDTH, self.HEIGHT = 960, 720
+        self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+
+        self.hands = mp_hands.Hands(
+            max_num_hands=2,
+            model_complexity=0,
+            min_detection_confidence=0.6,
+            min_tracking_confidence=0.5
+        )
+
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        # ===== LOAD PLANETS =====
+        planet_files = [
+            "matahari.png", "merkurius.png", "venus.png",
+            "bumi.png", "mars.png", "jupiter.png",
+            "saturnus.png", "uranus.png", "neptunus.png"
+        ]
+
+        self.planets = []
+        for f in planet_files:
+            img = cv2.imread(f, cv2.IMREAD_UNCHANGED)
+            if img is not None and img.shape[2] == 4:
+                self.planets.append(img)
+
+        self.state = {
+            "Left": {"orbit": 0, "rotate": 0, "history": deque(maxlen=6)},
+            "Right": {"orbit": 0, "rotate": 0, "history": deque(maxlen=6)}
+        }
+
+        self.canvas = tk.Canvas(window, width=self.WIDTH, height=self.HEIGHT, bg="black")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        self.update()
+        self.window.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.window.mainloop()
+
+    # ================= COUNT FINGERS =================
+    def count_fingers(self, hand, handedness):
+        tips = [4, 8, 12, 16, 20]
+        count = 0
+        if handedness == "Right":
+            if hand.landmark[4].x < hand.landmark[3].x:
+                count += 1
+        else:
+            if hand.landmark[4].x > hand.landmark[3].x:
+                count += 1
+        for i in range(1, 5):
+            if hand.landmark[tips[i]].y < hand.landmark[tips[i]-2].y:
+                count += 1
+        return count
+
+    # ================= OVERLAY PNG =================
+    def overlay_png(self, bg, png, x, y, size, state):
+        png = cv2.resize(png, (size, size))
+        state["rotate"] = (state["rotate"] + 2) % 360
+        M = cv2.getRotationMatrix2D((size//2, size//2), state["rotate"], 1)
+        png = cv2.warpAffine(png, M, (size, size))
+
+        h, w = png.shape[:2]
+        if x < 0 or y < 0 or x+w > bg.shape[1] or y+h > bg.shape[0]:
+            return
+
+        alpha = png[:, :, 3:] / 255.0
+        bg[y:y+h, x:x+w] = ((1 - alpha) * bg[y:y+h, x:x+w] + alpha * png[:, :, :3]).astype(np.uint8)
+
+    # ================= DRAW SINGLE HAND SYSTEM =================
+    def draw_hand_system(self, frame, cx, cy, fingers, state):
+        state["history"].append(fingers)
+        if state["history"].count(fingers) < 4:
+            return
+
+        count = min(fingers, len(self.planets))
+        state["orbit"] += 0.04
+        radius = 80
+        step = 2 * math.pi / max(count, 1)
+
+        for i in range(count):
+            angle = state["orbit"] + i * step
+            px = int(cx + radius * math.cos(angle))
+            py = int(cy + radius * math.sin(angle))
+            self.overlay_png(frame, self.planets[i], px - 45, py - 45, 90, state)
+
+    # ================= MAIN LOOP =================
+    def update(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            self.window.after(30, self.update)
+            return
+
+        frame = cv2.flip(frame, 1)
+        frame = cv2.resize(frame, (self.WIDTH, self.HEIGHT))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb)
+
+        palms = {}
+        finger_sum = 0
+
+        if result.multi_hand_landmarks:
+            for i, hand in enumerate(result.multi_hand_landmarks):
+                handedness = result.multi_handedness[i].classification[0].label
+                fingers = self.count_fingers(hand, handedness)
+                finger_sum += fingers
+
+                palm = hand.landmark[9]
+                cx = int(palm.x * self.WIDTH)
+                cy = int(palm.y * self.HEIGHT)
+
+                palms[handedness] = (cx, cy, fingers)
+                mp_draw.draw_landmarks(frame, hand, mp_hands.HAND_CONNECTIONS)
+
+        # ===== MULTIVERSE MODE (10 JARI) =====
+        if finger_sum == 10 and len(palms) == 2:
+            (x1, y1, _), (x2, y2, _) = palms.values()
+            mx, my = (x1 + x2)//2, (y1 + y2)//2
+            dist = int(math.hypot(x2 - x1, y2 - y1)//2)
+
+            for i, planet in enumerate(self.planets):
+                angle = (i * 2 * math.pi / len(self.planets)) + self.state["Left"]["orbit"]
+                px = int(mx + dist * math.cos(angle))
+                py = int(my + (dist//1.5) * math.sin(angle))
+                self.overlay_png(frame, planet, px-45, py-45, 90, self.state["Left"])
+
+            self.state["Left"]["orbit"] += 0.04
+            cv2.putText(frame, "MULTIVERSE MODE", (250, 80),
+                        cv2.FONT_HERSHEY_DUPLEX, 1.6, (255, 0, 255), 3)
+
+        # ===== NORMAL MODE (1–5 JARI PER TANGAN) =====
+        else:
+            for hand, (cx, cy, fingers) in palms.items():
+                self.draw_hand_system(frame, cx, cy, fingers, self.state[hand])
+
+        img = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        self.canvas.create_image(0, 0, image=img, anchor=tk.NW)
+        self.canvas.image = img
+        self.window.after(30, self.update)
+
+    def on_close(self):
+        self.cap.release()
+        self.window.destroy()
+
+
+if __name__ == "__main__":
+    PlanetUltimateApp(tk.Tk(), "AR Planet Multiverse Ultimate")
